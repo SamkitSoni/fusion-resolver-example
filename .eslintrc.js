@@ -3,7 +3,6 @@ module.exports = {
     env: {
         node: true
     },
-    ignorePatterns: ['*.mock.ts'],
     parser: '@typescript-eslint/parser',
     plugins: ['@typescript-eslint', 'unused-imports'],
     extends: [

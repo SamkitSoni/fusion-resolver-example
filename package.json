@@ -9,7 +9,9 @@
     "license": "MIT",
     "scripts": {
         "clean": "rimraf artifacts cache coverage contracts/hardhat-dependency-compiler",
-        "deploy": "hardhat deploy --network",
+        "deploy": "hardhat run scripts/deploy.ts",
+        "deploy:localhost": "hardhat run scripts/deploy.ts --network localhost",
+        "interact": "hardhat run scripts/interact.ts",
         "coverage": "hardhat coverage",
         "format": "yarn format-js && yarn format-sol",
         "format-js": "prettier '**/*.js' --write",
@@ -20,7 +22,8 @@
         "lint:sol:fix": "solhint --max-warnings 0 \"contracts/**/*.sol\" --fix",
         "lint": "yarn lint:js && yarn lint:sol",
         "lint:fix": "yarn lint:js:fix && yarn lint:sol:fix",
-        "test": "hardhat test"
+        "test": "hardhat test",
+        "test:fusion": "hardhat test test/FusionResolverEthereum.test.ts"
     },
     "dependencies": {
         "@1inch/fusion-sdk": "2",
