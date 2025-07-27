@@ -69,6 +69,13 @@ export class User {
         }
 
         await ethers.provider.send('hardhat_impersonateAccount', [donor])
+        
+        // Fund the donor account with ETH for gas fees
+        await ethers.provider.send('hardhat_setBalance', [
+            donor,
+            '0x56BC75E2D630E3804' // 100 ETH in hex
+        ])
+        
         const tmpSigner = await ethers.provider.getSigner(donor)
 
         await transfer(tmpSigner, tokenAddress, this.address, amount)
