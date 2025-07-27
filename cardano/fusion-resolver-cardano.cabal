@@ -5,7 +5,7 @@ synopsis:           Cardano side of the Ethereum-Cardano cross-chain Fusion+ Res
 description:        Handles atomic swaps between Ethereum and Cardano networks
 license:            MIT
 license-file:       LICENSE
-author:             DeFi United
+author:             Samkit
 maintainer:         defi@united.com
 category:           Blockchain
 build-type:         Simple
