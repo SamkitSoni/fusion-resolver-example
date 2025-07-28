@@ -66,6 +66,8 @@ pids
 tmp/
 temp/
 .tmp/
+PROJECT_SUMMARY.md
+SYSTEM_OVERVIEW.md
 
 # Jest
 jest_html_reporters.html
@@ -83,4 +85,7 @@ gas-report.txt
 *.keystore
 keystore/
 wallet.json
-mnemonic.txt
+mnemonic.txt/
+
+# Test Folders
+test

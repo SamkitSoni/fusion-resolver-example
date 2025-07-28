@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// This code is provided “as is” without warranties of any kind. 
+// This code is provided "as is" without warranties of any kind. 
 // 1inch does not assume responsibility for its security, suitability, or fitness for any specific use. 
 // Any party using this code is solely responsible for conducting independent audits before deployment.
 
@@ -8,145 +8,108 @@ pragma solidity ^0.8.20;
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
+import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { Address, AddressLib} from "@1inch/solidity-utils/contracts/libraries/AddressLib.sol";
 import { SafeERC20 } from "@1inch/solidity-utils/contracts/libraries/SafeERC20.sol";
+import { RevertReasonForwarder } from "@1inch/solidity-utils/contracts/libraries/RevertReasonForwarder.sol";
 import { IOrderMixin } from "@1inch/limit-order-protocol-contract/contracts/interfaces/IOrderMixin.sol";
 import { ITakerInteraction } from "@1inch/limit-order-protocol-contract/contracts/interfaces/ITakerInteraction.sol";
+import { TakerTraits } from "@1inch/limit-order-protocol-contract/contracts/libraries/TakerTraitsLib.sol";
+
+// Import from the real cross-chain-swap contracts using remapping
+import { EscrowFactory } from "cross-chain-swap/EscrowFactory.sol";
+import { Immutables } from "cross-chain-swap/libraries/ImmutablesLib.sol";
+import { Timelocks, TimelocksLib } from "cross-chain-swap/libraries/TimelocksLib.sol";
+
+import "./interfaces/IResolverExample.sol";
+import "./interfaces/ICardanoEscrowFactory.sol";
 
 /**
- * @title ResolverExample - Enhanced Cross-Chain Fusion+ Resolver
- * @dev Extended resolver with Ethereum-Cardano cross-chain atomic swap capabilities
+ * @title ResolverExample - Cross-Chain Fusion+ Resolver
+ * @dev Resolver for cross-chain atomic swaps using external escrow contracts
  */
-contract ResolverExample is ITakerInteraction, ReentrancyGuard, Pausable {
-    error OnlyOwner();
+contract ResolverExample is IResolverExample, ITakerInteraction, ReentrancyGuard, Pausable, Ownable {
     error NotTaker();
     error OnlyLOP();
     error FailedExternalCall(uint256 index, bytes reason);
-    error EscrowNotFound();
-    error EscrowAlreadyCompleted();
-    error InvalidSecret();
-    error TimelockNotExpired();
-    error TimelockExpired();
-    error InsufficientBalance();
-    error InvalidParameters();
-    error UnauthorizedResolver();
 
     using SafeERC20 for IERC20;
     using AddressLib for Address;
 
     // ============ Events ============
-    event EscrowCreated(
-        uint256 indexed escrowId,
-        bytes32 indexed secretHash,
-        address indexed token,
-        uint256 amount,
-        address beneficiary,
-        uint256 timelock,
-        string destinationChain,
-        string cardanoAddress
-    );
-    
-    event EscrowCompleted(
-        uint256 indexed escrowId,
-        bytes32 secret,
-        address indexed completer
-    );
-    
-    event EscrowCancelled(
-        uint256 indexed escrowId,
-        address indexed canceller,
-        uint256 safetyDepositClaimed
-    );
-    
     event OrderSettled(
         bytes32 indexed orderHash,
         address indexed maker,
         uint256 profit
     );
     
-    event SafetyDepositDeposited(
-        address indexed depositor,
-        uint256 amount
+    event EscrowSrcDeployed(
+        address indexed escrowAddress,
+        bytes32 indexed orderHash,
+        address indexed maker
     );
-
-    // ============ Structs ============
-    struct Escrow {
-        bytes32 secretHash;
-        uint256 timelock;
-        uint256 amount;
-        uint256 safetyDeposit;
-        address token;
-        address beneficiary;
-        address resolver;
-        bool completed;
-        bool cancelled;
-        string destinationChain;
-        string cardanoAddress;
-    }
-
-    struct AuctionParams {
-        uint256 startTime;
-        uint256 duration;
-        uint256 initialPrice;
-        uint256 minimumPrice;
-        uint256 baseFee;
-    }
+    
+    event EscrowDstDeployed(
+        address indexed escrowAddress,
+        address indexed taker
+    );
+    
+    // ETH-to-Cardano specific events
+    event ETHToCardanoSwapInitiated(
+        bytes32 indexed orderHash,
+        address indexed ethMaker,
+        bytes29 indexed cardanoTaker,
+        uint256 ethAmount,
+        uint256 adaAmount
+    );
+    
+    event CardanoEscrowCreated(
+        bytes32 indexed orderHash,
+        bytes29 cardanoAddress,
+        bytes32 cardanoTxHash,
+        uint256 adaAmount
+    );
+    
+    event ETHToCardanoSwapCompleted(
+        bytes32 indexed orderHash,
+        bytes32 secret,
+        address ethBeneficiary,
+        bytes29 cardanoBeneficiary
+    );
+    
+    event CardanoEscrowDstDeployed(
+        bytes32 indexed orderHash,
+        bytes29 indexed cardanoTaker,
+        bytes32 indexed txHash,
+        bytes29 cardanoAddress
+    );
 
     // ============ State Variables ============
     IOrderMixin private immutable _LOPV4;
-    address private immutable _OWNER;
-    
-    uint256 private _escrowCounter;
-    mapping(uint256 => Escrow) public escrows;
-    mapping(bytes32 => uint256) public secretHashToEscrow;
-    mapping(address => uint256) public safetyDeposits;
-    mapping(bytes32 => bool) public usedSecrets;
-    
-    // Emergency pause functionality
-    mapping(address => bool) public authorizedResolvers;
+    EscrowFactory private immutable _ESCROW_FACTORY;  // Use real EscrowFactory from cross-chain-swap
+    ICardanoEscrowFactory private immutable _CARDANO_ESCROW_FACTORY;
     
     // Gas price tracking for dynamic pricing
     uint256 public lastBaseFee;
     uint256 public constant MAX_GAS_PRICE_MULTIPLIER = 150; // 1.5x
 
-    // ============ Modifiers ============
-    modifier onlyOwner () {
-        if (msg.sender != _OWNER) revert OnlyOwner();
-        _;
-    }
-
-    modifier onlyAuthorizedResolver() {
-        if (!authorizedResolvers[msg.sender] && msg.sender != _OWNER) {
-            revert UnauthorizedResolver();
-        }
-        _;
-    }
-
-    modifier validEscrow(uint256 escrowId) {
-        if (escrowId >= _escrowCounter) revert EscrowNotFound();
-        if (escrows[escrowId].completed || escrows[escrowId].cancelled) {
-            revert EscrowAlreadyCompleted();
-        }
-        _;
-    }
-
     // ============ Constructor ============
-    constructor(IOrderMixin limitOrderProtocol) {
+    constructor(
+        IOrderMixin limitOrderProtocol,
+        EscrowFactory escrowFactory,  // Use real EscrowFactory
+        ICardanoEscrowFactory cardanoEscrowFactory,
+        address initialOwner
+    ) Ownable(initialOwner) {
         _LOPV4 = limitOrderProtocol;
-        _OWNER = msg.sender;
-        authorizedResolvers[msg.sender] = true;
+        _ESCROW_FACTORY = escrowFactory;
+        _CARDANO_ESCROW_FACTORY = cardanoEscrowFactory;
         lastBaseFee = block.basefee;
     }
 
+    // Allow contract to receive ETH
+    receive() external payable {}
+
     // ============ Owner Functions ============
-    function addAuthorizedResolver(address resolver) external onlyOwner {
-        authorizedResolvers[resolver] = true;
-    }
-
-    function removeAuthorizedResolver(address resolver) external onlyOwner {
-        authorizedResolvers[resolver] = false;
-    }
-
     function pause() external onlyOwner {
         _pause();
     }
@@ -169,136 +132,175 @@ contract ResolverExample is ITakerInteraction, ReentrancyGuard, Pausable {
     }
 
     function emergencyWithdraw(IERC20 token, uint256 amount) external onlyOwner {
-        token.safeTransfer(_OWNER, amount);
+        token.safeTransfer(owner(), amount);
     }
 
-    // ============ Escrow Functions ============
+    // ============ Cross-Chain Escrow Functions ============
     /**
-     * @dev Create a new escrow for Ethereum-Cardano atomic swap
+     * @notice Deploy a new escrow contract for maker on the source chain
+     * @dev Uses the cross-chain-swap escrow factory to create source escrow
      */
-    function createEscrow(
-        bytes32 secretHash,
-        uint256 timelock,
-        address token,
+    function deploySrc(
+        Immutables calldata immutables,
+        IOrderMixin.Order calldata order,
+        bytes32 r,
+        bytes32 vs,
         uint256 amount,
-        address beneficiary,
-        uint256 safetyDepositAmount,
-        string calldata destinationChain,
-        string calldata cardanoAddress
-    ) external onlyAuthorizedResolver whenNotPaused nonReentrant returns (uint256 escrowId) {
-        if (timelock <= block.timestamp) revert InvalidParameters();
-        if (amount == 0 || beneficiary == address(0)) revert InvalidParameters();
-        if (secretHashToEscrow[secretHash] != 0) revert InvalidParameters();
-        if (bytes(destinationChain).length == 0) revert InvalidParameters();
-        
-        // Validate destination chain is supported (only "cardano" for now)
-        if (keccak256(bytes(destinationChain)) != keccak256(bytes("cardano"))) {
-            revert InvalidParameters();
+        TakerTraits takerTraits,
+        bytes calldata args
+    ) external onlyOwner whenNotPaused {
+        // Set deployed timestamp for immutables using TimelocksLib
+        Immutables memory immutablesMem = immutables;
+        uint256 deployedAt = block.timestamp;
+        // Ensure timestamp fits in 32 bits for TimelocksLib
+        if (deployedAt > type(uint32).max) {
+            deployedAt = type(uint32).max;
         }
-
-        // Transfer tokens to escrow
-        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        immutablesMem.timelocks = TimelocksLib.setDeployedAt(immutables.timelocks, deployedAt);
         
-        // Handle safety deposit
-        if (safetyDepositAmount > 0) {
-            if (safetyDeposits[msg.sender] < safetyDepositAmount) {
-                revert InsufficientBalance();
-            }
-            safetyDeposits[msg.sender] -= safetyDepositAmount;
-        }
-
-        escrowId = _escrowCounter++;
+        // Calculate escrow address using factory
+        address computed = _ESCROW_FACTORY.addressOfEscrowSrc(immutablesMem);
         
-        escrows[escrowId] = Escrow({
-            secretHash: secretHash,
-            timelock: timelock,
-            amount: amount,
-            safetyDeposit: safetyDepositAmount,
-            token: token,
-            beneficiary: beneficiary,
-            resolver: msg.sender,
-            completed: false,
-            cancelled: false,
-            destinationChain: destinationChain,
-            cardanoAddress: cardanoAddress
-        });
+        // Send safety deposit to computed escrow address
+        (bool success,) = address(computed).call{value: immutablesMem.safetyDeposit}("");
+        require(success, "Safety deposit transfer failed");
 
-        secretHashToEscrow[secretHash] = escrowId;
+        // Set target flag for taker traits
+        // _ARGS_HAS_TARGET = 1 << 251
+        takerTraits = TakerTraits.wrap(TakerTraits.unwrap(takerTraits) | uint256(1 << 251));
+        
+        // Prepend target address to args
+        bytes memory argsMem = abi.encodePacked(computed, args);
+        
+        // Fill the order through LOP
+        _LOPV4.fillOrderArgs(order, r, vs, amount, takerTraits, argsMem);
 
-        emit EscrowCreated(escrowId, secretHash, token, amount, beneficiary, timelock, destinationChain, cardanoAddress);
+        emit EscrowSrcDeployed(computed, immutables.orderHash, immutables.maker.get());
     }
 
     /**
-     * @dev Withdraw from escrow using the secret
+     * @notice Deploy a new escrow contract for taker on the destination chain
+     * @dev Uses the cross-chain-swap escrow factory to create destination escrow
      */
-    function withdrawWithSecret(
-        uint256 escrowId,
-        bytes32 secret
-    ) external validEscrow(escrowId) whenNotPaused nonReentrant {
-        Escrow storage escrow = escrows[escrowId];
+    function deployDst(
+        Immutables calldata dstImmutables, 
+        uint256 srcCancellationTimestamp
+    ) external payable onlyOwner whenNotPaused {
+        // Create destination escrow through factory
+        _ESCROW_FACTORY.createDstEscrow{value: msg.value}(dstImmutables, srcCancellationTimestamp);
         
-        if (block.timestamp >= escrow.timelock) revert TimelockExpired();
-        if (keccak256(abi.encodePacked(secret)) != escrow.secretHash) revert InvalidSecret();
-        if (usedSecrets[secret]) revert InvalidSecret();
-
-        escrow.completed = true;
-        usedSecrets[secret] = true;
-
-        // Transfer tokens to beneficiary
-        IERC20(escrow.token).safeTransfer(escrow.beneficiary, escrow.amount);
-
-        // Return safety deposit to resolver
-        if (escrow.safetyDeposit > 0) {
-            safetyDeposits[escrow.resolver] += escrow.safetyDeposit;
-        }
-
-        emit EscrowCompleted(escrowId, secret, msg.sender);
+        // Calculate the escrow address (for event emission)
+        address escrowAddress = _ESCROW_FACTORY.addressOfEscrowSrc(dstImmutables);
+        
+        emit EscrowDstDeployed(escrowAddress, dstImmutables.taker.get());
     }
 
     /**
-     * @dev Cancel expired escrow and claim safety deposit
+     * @notice Deploy a new escrow contract on Cardano for EVM-to-Cardano swaps
+     * @dev Creates Cardano-side escrow through the Cardano factory
      */
-    function cancelExpiredEscrow(
-        uint256 escrowId
-    ) external validEscrow(escrowId) whenNotPaused nonReentrant {
-        Escrow storage escrow = escrows[escrowId];
+    function deployCardanoDst(
+        ICardanoEscrowFactory.CardanoImmutables calldata cardanoImmutables,
+        uint256 srcCancellationTimestamp
+    ) external payable onlyOwner whenNotPaused {
+        // Create Cardano destination escrow through factory
+        bytes32 txHash = _CARDANO_ESCROW_FACTORY.createCardanoDstEscrow{value: msg.value}(
+            cardanoImmutables, 
+            srcCancellationTimestamp
+        );
         
-        if (block.timestamp < escrow.timelock) revert TimelockNotExpired();
-
-        escrow.cancelled = true;
-
-        // Return tokens to resolver (original depositor)
-        IERC20(escrow.token).safeTransfer(escrow.resolver, escrow.amount);
-
-        // Award safety deposit to canceller (incentive for cleanup)
-        uint256 safetyDepositReward = escrow.safetyDeposit;
-        if (safetyDepositReward > 0) {
-            safetyDeposits[msg.sender] += safetyDepositReward;
-        }
-
-        emit EscrowCancelled(escrowId, msg.sender, safetyDepositReward);
+        // Calculate the Cardano escrow address (for event emission)
+        bytes29 cardanoAddress = _CARDANO_ESCROW_FACTORY.addressOfCardanoEscrow(cardanoImmutables);
+        
+        emit CardanoEscrowDstDeployed(
+            cardanoImmutables.orderHash,
+            cardanoImmutables.cardanoTaker,
+            txHash,
+            cardanoAddress
+        );
     }
 
+    // ============ ETH-to-Cardano Atomic Swap Functions ============
+    
     /**
-     * @dev Deposit safety deposit for future escrows
+     * @notice Initiate a complete ETH-to-Cardano atomic swap
+     * @dev This is the main function resolvers call for ETH-to-ADA swaps
+     * @param order The limit order from the maker wanting to swap ETH for ADA
+     * @param cardanoDestination The Cardano address where maker wants to receive ADA
+     * @param r R component of signature
+     * @param vs VS component of signature
+     * @param amount Taker amount to fill
+     * @param takerTraits Taker traits for the order
+     * @param args Additional arguments
      */
-    function depositSafetyDeposit() external payable whenNotPaused {
-        safetyDeposits[msg.sender] += msg.value;
-        emit SafetyDepositDeposited(msg.sender, msg.value);
-    }
-
-    /**
-     * @dev Withdraw safety deposit
-     */
-    function withdrawSafetyDeposit(uint256 amount) external nonReentrant {
-        if (safetyDeposits[msg.sender] < amount) revert InsufficientBalance();
+    function initiateETHToCardanoSwap(
+        IOrderMixin.Order calldata order,
+        bytes29 cardanoDestination,
+        bytes32 r,
+        bytes32 vs,
+        uint256 amount,
+        TakerTraits takerTraits,
+        bytes calldata args
+    ) external payable onlyOwner whenNotPaused {
+        bytes32 orderHash = _calculateOrderHash(order);
         
-        safetyDeposits[msg.sender] -= amount;
-        payable(msg.sender).transfer(amount);
+        // Validate that this is an ETH-to-ADA swap
+        require(order.makerAsset.get() == address(0), "Only ETH-to-ADA swaps supported");
+        require(msg.value >= order.takingAmount, "Insufficient ADA provided");
+        
+        // 1. Deploy ETH source escrow first
+        _deployETHSourceEscrow(order, orderHash, r, vs, amount, takerTraits, args);
+        
+        // 2. Deploy Cardano destination escrow
+        _deployCardanoDestinationEscrow(
+            order, 
+            orderHash, 
+            cardanoDestination, 
+            order.takingAmount
+        );
+        
+        emit ETHToCardanoSwapInitiated(
+            orderHash,
+            order.maker.get(),
+            cardanoDestination,
+            order.makingAmount, // ETH amount
+            order.takingAmount  // ADA amount
+        );
+    }
+    
+    /**
+     * @notice Complete ETH-to-Cardano swap by revealing secret
+     * @dev Resolver calls this to claim ETH and reveal secret for Cardano side
+     * @param orderHash The order hash
+     * @param secret The secret that unlocks both escrows
+     * @param ethImmutables The ETH escrow immutables
+     * @param cardanoAddress The Cardano address that will receive ADA
+     */
+    function completeETHToCardanoSwap(
+        bytes32 orderHash,
+        bytes32 secret,
+        Immutables calldata ethImmutables,
+        bytes29 cardanoAddress
+    ) external onlyOwner whenNotPaused {
+        // Validate secret against hashlock
+        require(keccak256(abi.encodePacked(secret)) == ethImmutables.hashlock, "Invalid secret");
+        
+        // Get ETH escrow address
+        address ethEscrowAddress = _ESCROW_FACTORY.addressOfEscrowSrc(ethImmutables);
+        
+        // Withdraw ETH from source escrow (this reveals the secret publicly)
+        _withdrawFromETHEscrow(ethEscrowAddress, secret, ethImmutables);
+        
+        emit ETHToCardanoSwapCompleted(
+            orderHash,
+            secret,
+            address(this), // Resolver gets the ETH
+            cardanoAddress  // Maker can now claim ADA using the revealed secret
+        );
     }
 
     // ============ LOP Integration Functions ============
-    function settleOrders(bytes calldata data) external onlyAuthorizedResolver whenNotPaused {
+    function settleOrders(bytes calldata data) external onlyOwner whenNotPaused {
         _settleOrders(data);
     }
 
@@ -351,44 +353,176 @@ contract ResolverExample is ITakerInteraction, ReentrancyGuard, Pausable {
         emit OrderSettled(orderHash, order.maker.get(), profit);
     }
 
-    // ============ Auction & Pricing Functions ============
+    // ============ ETH-to-Cardano Internal Functions ============
+    
     /**
-     * @dev Calculate Dutch auction price considering gas costs
+     * @notice Deploy ETH source escrow
+     * @dev Internal function to deploy source escrow on ETH side
      */
-    function calculateAuctionPrice(
-        AuctionParams memory params
-    ) public view returns (uint256 currentPrice) {
-        if (block.timestamp < params.startTime) {
-            return params.initialPrice;
-        }
-
-        uint256 elapsed = block.timestamp - params.startTime;
-        if (elapsed >= params.duration) {
-            return _adjustPriceForGas(params.minimumPrice, params.baseFee);
-        }
-
-        // Linear price decay
-        uint256 priceDecay = ((params.initialPrice - params.minimumPrice) * elapsed) / params.duration;
-        uint256 basePrice = params.initialPrice - priceDecay;
+    function _deployETHSourceEscrow(
+        IOrderMixin.Order calldata order,
+        bytes32 orderHash,
+        bytes32 r,
+        bytes32 vs,
+        uint256 amount,
+        TakerTraits takerTraits,
+        bytes calldata args
+    ) internal returns (address ethEscrowAddress) {
+        // Create immutables for ETH source escrow
+        Immutables memory ethImmutables = Immutables({
+            orderHash: orderHash,
+            hashlock: _generateHashlock(orderHash),
+            maker: order.maker,
+            taker: Address.wrap(uint160(address(this))), // Resolver is the taker
+            token: order.makerAsset, // ETH (address(0))
+            amount: order.makingAmount,
+            safetyDeposit: _calculateSafetyDeposit(order.makingAmount),
+            timelocks: _generateTimelocks()
+        });
         
-        return _adjustPriceForGas(basePrice, params.baseFee);
+        // Calculate escrow address
+        ethEscrowAddress = _ESCROW_FACTORY.addressOfEscrowSrc(ethImmutables);
+        
+        // Send safety deposit to escrow
+        (bool success,) = ethEscrowAddress.call{value: ethImmutables.safetyDeposit}("");
+        require(success, "Safety deposit transfer failed");
+        
+        // Set target flag for taker traits
+        takerTraits = TakerTraits.wrap(TakerTraits.unwrap(takerTraits) | uint256(1 << 251));
+        
+        // Prepend target address to args
+        bytes memory argsMem = abi.encodePacked(ethEscrowAddress, args);
+        
+        // Fill the order through LOP (this locks the ETH)
+        _LOPV4.fillOrderArgs(order, r, vs, amount, takerTraits, argsMem);
+        
+        emit EscrowSrcDeployed(ethEscrowAddress, orderHash, order.maker.get());
+        
+        return ethEscrowAddress;
+    }
+    
+    /**
+     * @notice Deploy Cardano destination escrow
+     * @dev Internal function to deploy destination escrow on Cardano side
+     */
+    function _deployCardanoDestinationEscrow(
+        IOrderMixin.Order calldata /* order */,
+        bytes32 orderHash,
+        bytes29 cardanoDestination,
+        uint256 adaAmount
+    ) internal returns (bytes32 cardanoTxHash) {
+        // Create Cardano immutables
+        ICardanoEscrowFactory.CardanoImmutables memory cardanoImmutables = ICardanoEscrowFactory.CardanoImmutables({
+            orderHash: orderHash,
+            hashlock: _generateHashlock(orderHash),
+            cardanoMaker: cardanoDestination, // Where maker receives ADA
+            cardanoTaker: _evmToCardanoAddress(address(this)), // Resolver as taker
+            policyId: bytes32(0), // ADA has no policy ID
+            assetName: bytes32(0), // ADA has no asset name
+            amount: adaAmount,
+            adaSafetyDeposit: _calculateCardanoSafetyDeposit(adaAmount),
+            timelocks: _generateTimelocks()
+        });
+        
+        // Create Cardano destination escrow
+        cardanoTxHash = _CARDANO_ESCROW_FACTORY.createCardanoDstEscrow{value: msg.value}(
+            cardanoImmutables,
+            block.timestamp + 3600 // 1 hour cancellation window
+        );
+        
+        // Calculate Cardano address
+        bytes29 cardanoAddress = _CARDANO_ESCROW_FACTORY.addressOfCardanoEscrow(cardanoImmutables);
+        
+        emit CardanoEscrowCreated(
+            orderHash,
+            cardanoAddress,
+            cardanoTxHash,
+            adaAmount
+        );
+        
+        return cardanoTxHash;
+    }
+    
+    /**
+     * @notice Withdraw ETH from source escrow using secret
+     * @dev Internal function to claim ETH and reveal secret
+     */
+    function _withdrawFromETHEscrow(
+        address escrowAddress,
+        bytes32 secret,
+        Immutables calldata immutables
+    ) internal {
+        // Call withdraw function on ETH escrow contract
+        bytes memory withdrawCall = abi.encodeWithSignature(
+            "withdraw(bytes32,(bytes32,bytes32,address,address,address,uint256,uint256,uint256))",
+            secret,
+            immutables
+        );
+        
+        (bool success,) = escrowAddress.call(withdrawCall);
+        require(success, "ETH escrow withdrawal failed");
+    }
+    
+    /**
+     * @notice Generate deterministic hashlock for both chains
+     */
+    function _generateHashlock(bytes32 orderHash) internal view returns (bytes32) {
+        return keccak256(abi.encodePacked(orderHash, block.timestamp, block.prevrandao));
+    }
+    
+    /**
+     * @notice Generate timelocks for both escrows
+     */
+    function _generateTimelocks() internal view returns (Timelocks) {
+        return TimelocksLib.setDeployedAt(Timelocks.wrap(0), block.timestamp);
+    }
+    
+    /**
+     * @notice Calculate safety deposit (1% of amount)
+     */
+    function _calculateSafetyDeposit(uint256 amount) internal pure returns (uint256) {
+        return amount / 100;
+    }
+    
+    /**
+     * @notice Calculate Cardano safety deposit (minimum 2 ADA)
+     */
+    function _calculateCardanoSafetyDeposit(uint256 adaAmount) internal pure returns (uint256) {
+        uint256 calculated = adaAmount / 100;
+        return calculated < 2_000_000 ? 2_000_000 : calculated; // 2 ADA minimum in lovelace
+    }
+    
+    /**
+     * @notice Convert EVM address to Cardano address format
+     */
+    function _evmToCardanoAddress(address evmAddr) internal view returns (bytes29) {
+        return _CARDANO_ESCROW_FACTORY.evmToCardanoAddress(evmAddr);
+    }
+    
+    /**
+     * @notice Calculate order hash
+     */
+    function _calculateOrderHash(IOrderMixin.Order calldata order) internal pure returns (bytes32) {
+        return keccak256(abi.encode(order));
     }
 
+    // ============ Utility Functions ============
     /**
-     * @dev Adjust price based on current gas conditions
+     * @notice Allows the owner to make arbitrary calls to other contracts
+     * @dev Useful for emergency operations or complex interactions
      */
-    function _adjustPriceForGas(uint256 basePrice, uint256 expectedBaseFee) internal view returns (uint256) {
-        if (block.basefee <= expectedBaseFee) {
-            return basePrice;
+    function arbitraryCalls(
+        address[] calldata targets, 
+        bytes[] calldata arguments
+    ) external onlyOwner {
+        uint256 length = targets.length;
+        if (targets.length != arguments.length) revert LengthMismatch();
+        
+        for (uint256 i = 0; i < length; ++i) {
+            // solhint-disable-next-line avoid-low-level-calls
+            (bool success,) = targets[i].call(arguments[i]);
+            if (!success) RevertReasonForwarder.reRevert();
         }
-
-        // Adjust price upward if gas is more expensive than expected
-        uint256 gasMultiplier = (block.basefee * 100) / expectedBaseFee;
-        if (gasMultiplier > MAX_GAS_PRICE_MULTIPLIER) {
-            gasMultiplier = MAX_GAS_PRICE_MULTIPLIER;
-        }
-
-        return (basePrice * gasMultiplier) / 100;
     }
 
     /**
@@ -408,32 +542,19 @@ contract ResolverExample is ITakerInteraction, ReentrancyGuard, Pausable {
     }
 
     // ============ View Functions ============
-    function getEscrow(uint256 escrowId) external view returns (Escrow memory) {
-        return escrows[escrowId];
-    }
-
-    function getEscrowBySecretHash(bytes32 secretHash) external view returns (Escrow memory) {
-        uint256 escrowId = secretHashToEscrow[secretHash];
-        return escrows[escrowId];
-    }
-
-    function isEscrowActive(uint256 escrowId) external view returns (bool) {
-        if (escrowId >= _escrowCounter) return false;
-        Escrow memory escrow = escrows[escrowId];
-        return !escrow.completed && !escrow.cancelled && block.timestamp < escrow.timelock;
-    }
-
-    function getResolverSafetyDeposit(address resolver) external view returns (uint256) {
-        return safetyDeposits[resolver];
-    }
-
     function getCurrentBaseFee() external view returns (uint256) {
         return block.basefee;
     }
 
-    // ============ Emergency Functions ============
-    receive() external payable {
-        safetyDeposits[msg.sender] += msg.value;
-        emit SafetyDepositDeposited(msg.sender, msg.value);
+    function getEscrowFactory() external view returns (address) {
+        return address(_ESCROW_FACTORY);
+    }
+
+    function getCardanoEscrowFactory() external view returns (address) {
+        return address(_CARDANO_ESCROW_FACTORY);
+    }
+
+    function getLimitOrderProtocol() external view returns (address) {
+        return address(_LOPV4);
     }
 }

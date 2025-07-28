@@ -17,12 +17,31 @@ async function main() {
         localhost: '0x111111125421ca6dc452d289314280a0f8842a65'
     }
 
+    // Cross-chain swap escrow factory addresses (you'll need to update these with actual deployed addresses)
+    const ESCROW_FACTORY_ADDRESSES: { [key: string]: string } = {
+        mainnet: '0x0000000000000000000000000000000000000000', // Replace with actual address
+        polygon: '0x0000000000000000000000000000000000000000', // Replace with actual address
+        arbitrum: '0x0000000000000000000000000000000000000000', // Replace with actual address
+        optimism: '0x0000000000000000000000000000000000000000', // Replace with actual address
+        bsc: '0x0000000000000000000000000000000000000000', // Replace with actual address
+        avalanche: '0x0000000000000000000000000000000000000000', // Replace with actual address
+        hardhat: '0x0000000000000000000000000000000000000001', // Mock address for testing
+        localhost: '0x0000000000000000000000000000000000000001' // Mock address for testing
+    }
+
     const lopAddress = LOP_ADDRESSES[network.name]
+    const escrowFactoryAddress = ESCROW_FACTORY_ADDRESSES[network.name]
+    
     if (!lopAddress) {
         throw new Error(`LOP address not configured for network: ${network.name}`)
     }
+    
+    if (!escrowFactoryAddress) {
+        throw new Error(`Escrow factory address not configured for network: ${network.name}`)
+    }
 
     console.log(`Using LOP address: ${lopAddress}`)
+    console.log(`Using Escrow Factory address: ${escrowFactoryAddress}`)
 
     const [deployer] = await hre.ethers.getSigners()
     console.log(`Deploying with account: ${deployer.address}`)
@@ -30,7 +49,7 @@ async function main() {
 
     // Deploy ResolverExample with cross-chain capabilities
     const ResolverFactory = await hre.ethers.getContractFactory('ResolverExample')
-    const resolver = await ResolverFactory.deploy(lopAddress) as ResolverExample
+    const resolver = await ResolverFactory.deploy(lopAddress, escrowFactoryAddress, deployer.address) as ResolverExample
 
     await resolver.waitForDeployment()
     const resolverAddress = await resolver.getAddress()
@@ -60,19 +79,21 @@ async function main() {
     // Log deployment info
     console.log('\n=== DEPLOYMENT SUMMARY ===')
     console.log(`Network: ${network.name}`)
-    console.log(`FusionResolverEthereum: ${resolverAddress}`)
+    console.log(`ResolverExample: ${resolverAddress}`)
     console.log(`LOP Address: ${lopAddress}`)
+    console.log(`Escrow Factory: ${escrowFactoryAddress}`)
     console.log(`Deployer: ${deployer.address}`)
     console.log(`Gas used: Check transaction receipt`)
     
     if (network.name !== 'hardhat' && network.name !== 'localhost') {
         console.log('\nTo verify on Etherscan, run:')
-        console.log(`npx hardhat verify --network ${network.name} ${resolverAddress} "${lopAddress}"`)
+        console.log(`npx hardhat verify --network ${network.name} ${resolverAddress} "${lopAddress}" "${escrowFactoryAddress}" "${deployer.address}"`)
     }
 
     return {
         resolverAddress,
         lopAddress,
+        escrowFactoryAddress,
         deployer: deployer.address
     }
 }
